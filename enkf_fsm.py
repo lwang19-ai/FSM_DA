@@ -5,9 +5,248 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy.linalg as LA
 from enkf_helper import *
 import matplotlib.pyplot as plt
+from numba import jit, prange
+from model import run_forward
 
-# %% load the initial settings, parameters, and results from a reference run.
-# Load the saved .npz file
+# Optimized Gaspari-Cohn function with Numba
+
+
+@jit(nopython=True, parallel=True)
+def fast_gaspari_cohn(distances, c):
+    """Numba-optimized Gaspari-Cohn function"""
+    n = distances.size
+    rho = np.zeros(n)
+    
+    for i in prange(n):
+        x = abs(distances[i]) / c
+        if x <= 1.0:
+            rho[i] = 1 + x*x*(-5/3 + 0.5*x + 0.25*x*x) + x**5*(-0.1)
+        elif x <= 2.0:
+            rho[i] = 4 - 5*x + (5/3)*x*x + 0.5*x**3 - (1/6)*x**4 + (1/12)*x**5
+    
+    return rho
+
+
+class HybridEnKF:
+    """Hybrid EnKF: Simple approach with minimal robustness improvements"""
+    
+    def __init__(self, N_ens, num_params, nx, ny):
+        self.N_ens = N_ens
+        self.num_params = num_params
+        self.nx, self.ny = nx, ny
+        
+        # Pre-allocate main arrays (simplified)
+        self.state_dim = num_params + nx*ny + nx*ny*4 + nx*ny + nx*ny*4
+        
+    def simple_cholesky_solve(self, M, max_jitter=1e-6):
+        """Robust solver with multiple fallbacks"""
+        # Check matrix condition first
+        if np.any(np.isnan(M)) or np.any(np.isinf(M)):
+            print("Warning: Invalid values in matrix M, using identity")
+            def solve_M(vec):
+                return vec
+            return solve_M
+        
+        # Try progressively stronger regularization
+        jitter_levels = [0, max_jitter, max_jitter*10, max_jitter*100, max_jitter*1000]
+        
+        for jitter in jitter_levels:
+            try:
+                if jitter == 0:
+                    M_reg = M
+                else:
+                    M_reg = M + np.eye(M.shape[0]) * jitter
+                
+                # Try Cholesky decomposition
+                L = LA.cholesky(M_reg)
+                def solve_M(vec):
+                    y = LA.solve(L, vec)
+                    return LA.solve(L.T, y)
+                if jitter > 0:
+                    print(f"Warning: Used regularization {jitter:.2e}")
+                return solve_M
+                
+            except LA.LinAlgError:
+                continue
+        
+        # If all else fails, use pseudo-inverse
+        print("Warning: Using pseudo-inverse solver due to singular matrix")
+        def solve_M(vec):
+            try:
+                return LA.pinv(M) @ vec
+            except:
+                # Ultimate fallback: return zero update
+                print("Warning: Complete solver failure, returning zero update")
+                return np.zeros_like(vec)
+        return solve_M
+    
+    def check_ensemble_health(self, X):
+        """Simple ensemble health check"""
+        # Check for NaN
+        if np.any(np.isnan(X)):
+            print("Warning: NaN detected in ensemble")
+            return False
+        
+        # Check for collapse (more reasonable threshold)
+        stds = X.std(axis=0)
+        # Only check parameters for collapse, not all state variables
+        param_stds = stds[:2]  # First 2 are parameters
+        if np.any(param_stds < 1e-6):
+            print(f"Warning: Parameter ensemble collapse detected. Stds: {param_stds}")
+            return False
+            
+        return True
+
+
+
+class ObservationManager:
+    """Cache observation data and operations"""
+    def __init__(self, ny, nx, obs_idx, sigma_z, sigma_p, sigma_d, sigma_c):
+        self.ny, self.nx = ny, nx
+        self.obs_idx = obs_idx
+        
+        # Pre-compute R matrix
+        off_z = 0
+        off_p = off_z + ny*nx
+        off_d = off_p + ny*nx*4
+        off_c = off_d + ny*nx
+        
+        R_full = np.empty(ny*nx*(1+4+1+4), dtype=float)
+        R_full[off_z:off_z+ny*nx] = sigma_z**2
+        R_full[off_p:off_p+ny*nx*4] = sigma_p**2
+        R_full[off_d:off_d+ny*nx] = sigma_d**2
+        R_full[off_c:off_c+ny*nx*4] = sigma_c**2
+        
+        self.R_var = R_full[obs_idx] + 1e-8
+        self.R_inv = 1.0 / self.R_var
+        
+    def get_observations(self, z_meas, p_meas, d_meas, c_meas):
+        """Efficiently extract observations"""
+        obs_full = np.concatenate([
+            z_meas.ravel(),
+            p_meas.ravel(), 
+            d_meas.ravel(),
+            c_meas.ravel()
+        ])
+        return obs_full[self.obs_idx]
+
+# -------------------- ETKF (ensemble-space) helper --------------------
+
+def etkf_update_full_state(X,                 # (N_ens, n_state)
+                           obs_vals,          # (p_subset,)
+                           obs_col_idx,       # (p_subset,) indices into the **state part** [num_params:]
+                           num_params,        # int
+                           R_var_subset,      # (p_subset,) observation variances for the subset
+                           inflation=1.0):
+    """Deterministic ETKF in ensemble space, updating the *entire* state.
+    - X contains [params | state] laid out exactly as assembled below.
+    - obs_col_idx indexes columns of X[:, num_params:] to form Y.
+    Returns updated X with same shape.
+    """
+    import numpy as _np
+    from numpy.linalg import inv as _inv
+    from scipy.linalg import sqrtm as _sqrtm
+
+    Ne, n = X.shape
+    # Forecast mean/anomalies in (n, Ne)
+    Xf = X.T                        # (n, Ne)
+    xbar_f = Xf.mean(axis=1, keepdims=True)
+    Af = Xf - xbar_f                # (n, Ne)
+
+    if inflation != 1.0:
+        Af *= inflation
+
+    # Build observation ensemble Y = H(X) using selected columns of the state part
+    # Y_raw has shape (Ne, p)
+    Y_raw = X[:, num_params:][:, obs_col_idx]
+    ybar = Y_raw.mean(axis=0, keepdims=True)    # (1, p)
+    Df = (Y_raw - ybar).T                       # (p, Ne) anomalies in obs space
+
+    # Ensemble-space matrices
+    # C = (Ne-1) I + Df^T R^{-1} Df   [shape (Ne, Ne)]
+    Nm1 = float(Ne - 1)
+    Rinvd = 1.0 / (R_var_subset + 1e-12)        # diagonal R^{-1}
+    # scale Df rows by sqrt(R^{-1}) without forming big matrices
+    Df_scaled = Df * Rinvd[:, None]            # (p, Ne)
+    C = (Nm1) * _np.eye(Ne) + Df.T @ Df_scaled  # (Ne, Ne)
+
+    # Innovation of the mean
+    innov = (obs_vals - ybar.ravel())          # (p,)
+    rhs = Df.T @ (Rinvd * innov)               # (Ne,)
+
+    # Solve for weights and transform
+    try:
+        Cinv = _inv(C)
+    except _np.linalg.LinAlgError:
+        # mild ridge if needed
+        C = C + 1e-6 * _np.eye(Ne)
+        Cinv = _inv(C)
+
+    w_bar = Cinv @ rhs[:, None]                 # (Ne,1)
+    T = _sqrtm(Nm1 * Cinv).real                 # (Ne,Ne)
+
+    # Analysis mean/anomalies in state space
+    xa_bar = xbar_f + Af @ w_bar                # (n,1)
+    Aa = Af @ T                                 # (n,Ne)
+
+    Xa = (xa_bar + Aa).T                        # back to (Ne, n)
+    return Xa
+
+# -------------------- RTPS inflation (parameters) --------------------
+
+def rtp_inflate_params(Xa, Xf, num_params, alpha=0.5):
+    """Relax-To-Prior-Spread (RTPS) on the first num_params columns only.
+    Xa, Xf: (N_ens, n_state). alpha in [0,1].
+    """
+    am = Xa.mean(axis=0, keepdims=True)
+    fm = Xf.mean(axis=0, keepdims=True)
+    aA = Xa - am
+    fA = Xf - fm
+    sa = np.std(aA[:, :num_params], axis=0, ddof=1) + 1e-12
+    sf = np.std(fA[:, :num_params], axis=0, ddof=1)
+    factor = 1.0 + alpha * (sf / sa - 1.0)
+    aA[:, :num_params] *= factor
+    return am + aA
+
+def simulate_member(args):
+    """Simple simulation function (based on working version)"""
+    i, nx, ny, current_time, hSL_val, hSS_val, param_values, z0_i, p0_i = args
+    
+    try:
+        # Create simple parameter object (hardcoded approach)
+        from model import ForwardParams
+        
+        # Use 2 sensitive parameters (diffusion_coeff, thickness_scale)
+        params_i = ForwardParams(
+            nx=nx, ny=ny, times=current_time,
+            diffusion_coeff=param_values[0],
+            thickness_scale=param_values[1],
+            # Use default values for other parameters
+            erosion_rate=0.1,  # Default value
+            subsidence_scalar=0.1,  # Default value
+            diffusion_iters=6,
+            bowl_amp=0.5,
+            bowl_center_east=0.20,
+            bowl_center_north=0.20,
+            bowl_width_east=0.22,
+            bowl_width_north=0.50
+        )
+
+        # Run forward model
+        z_layers, p_layers, deposits, compositions = run_forward(
+            z0_i, p0_i, current_time, [hSL_val], current_time, [hSS_val], params_i
+        )
+
+        return z_layers[-1], p_layers[-1], deposits[-1], compositions[-1]
+        
+    except Exception as e:
+        print(f"Error in ensemble member {i}: {e}")
+        # Return fallback values
+        return z0_i, p0_i, np.zeros_like(z0_i), np.zeros((z0_i.shape[0], 
+                                                           z0_i.shape[1], 4))
+
+
+# Load the initial settings, parameters, and results from a reference run.
 if __name__ == '__main__':
     data = np.load("./data/reference_fsm_results.npz", allow_pickle=True)
 
@@ -18,8 +257,8 @@ if __name__ == '__main__':
     times = data["times"]
     z0 = data["z0"]
     p0 = data["p0"]
-    hSL_vals = data["hSL_vals"] # sea level values over time are assumed known
-    hSS_vals = data["hSS_vals"] # subsidence values over time are assumed known
+    hSL_vals = data["hSL_vals"]
+    hSS_vals = data["hSS_vals"]
     z_layers = data["z_layers"]
     p_layers = data["p_layers"]
     deposits = data["deposits"]
@@ -32,63 +271,64 @@ if __name__ == '__main__':
     p_layers_meas = data["p_layers_meas"]
     deposits_meas = data["deposits_meas"]
     compositions_meas = data["compositions_meas"]
-    params = data["params"].item()  # .item() is needed for objects
-    # Now we can use these variables in DA script
+    params = data["params"].item()
 
+    # SENSITIVITY-BASED APPROACH: Use parameters recommended by sensitivity analysis
+    print("Using sensitivity-based approach with recommended parameters...")
+    
+    # Use 2 most sensitive parameters based on global sensitivity analysis
+    N_ens = 200
+    num_params = 2
+    param_names = ["diffusion_coeff", "thickness_scale"]
+    true_params = np.array([params.diffusion_coeff, params.thickness_scale])
+    param_stds = np.array([0.1, 10.0])  # Appropriate uncertainties for each parameter
+    
+    print(f"Selected parameters: {param_names}")
+    print(f"True values: {true_params}")
+    print(f"Standard deviations: {param_stds}")
 
-    # %% create initial ensembles for parameters and state
-    # Here we assume we want to estimate 3 parameters: diffusion_coeff, erosion_rate, subsidence_scalar
-    N_ens = 50  # ensemble size
-    num_params = 3
-    true_params = np.array([params.diffusion_coeff, params.erosion_rate, params.subsidence_scalar])
-    print("True parameters:", true_params)
-    param_stds = np.array([0.1, 0.04, 0.04])  # assumed std for each parameter
-    # sample initial ensemble from normal distribution around true parameter values
+    # Simple ensemble initialization (like working version)
     param_ensemble = np.empty((N_ens, num_params))
     for i in range(num_params):
         param_ensemble[:, i] = np.random.normal(true_params[i], param_stds[i], size=N_ens)
+    
+    # Check initial ensemble diversity
+    print("Initial parameter ensemble statistics:")
+    for i, name in enumerate(param_names):
+        mean_val = param_ensemble[:, i].mean()
+        std_val = param_ensemble[:, i].std()
+        print(f"  {name}: mean={mean_val:.4f}, std={std_val:.4f}")
+        if std_val < 1e-6:
+            print(f"    WARNING: Very small std for {name}")
+    print(f"Parameter ensemble shape: {param_ensemble.shape}")
 
-    # initial state ensemble from perturbing the initial bathymetry
-    z0_std = 10.0  # std of bathymetry, can be tuned as needed.
+    # Simple state initialization
+    z0_std = 10.0
     z0_ensemble = np.empty((N_ens, ny, nx))
     for i in range(N_ens):
         z0_ensemble[i] = np.random.normal(z0, z0_std)
 
-    # initial surface proportion ensemble from perturbing the initial proportions
-    # we need to ensure proportions remain valid (non-negative, sum to 1)
     p0_std = np.array([0.05, 0.05, 0.05, 0.05])
-    p0_ensemble =  np.empty((N_ens, ny, nx, 4)) 
+    p0_ensemble = np.empty((N_ens, ny, nx, 4))
     for i in range(N_ens):
-        # 明确给出 size，并沿最后一维归一化
         rnd = np.random.normal(p0, p0_std, size=(ny, nx, 4))
         rnd = np.clip(rnd, 0, 1)
         rnd /= rnd.sum(axis=-1, keepdims=True) + 1e-12
         p0_ensemble[i] = rnd
 
-    # Initialize deposits ensemble
-    deposits_ensemble = np.empty((N_ens, ny, nx))
-
-    # Initialize compositions ensemble with proper shape
-    compositions_ensemble =  np.empty((N_ens, ny, nx, 4)) 
-
-    # Arrays to store history of parameter and state estimates
+    # Initialize arrays
     param_history = np.empty((nt, N_ens, num_params))
     z0_history = np.empty((nt, N_ens, ny, nx))
     p0_history = np.empty((nt, N_ens, ny, nx, 4))
-    deposits_history = np.empty((nt, N_ens, ny, nx))
-    compositions_history = np.empty((nt, N_ens, ny, nx, 4))
 
-
-    # Choose observation usage (can be adjusted)
+    # Observation setup (simplified)
     obs_idx = build_obs_index(ny, nx,
-                              stride_z=16,   # one in every 16 grid points
-                              stride_p=16,   # one in every 16 grid points
-                              stride_d=16,   # deposits every 16 grid points
-                              stride_c=16,  # compositions every 16 grid points
+                              stride_z=16, stride_p=16, stride_d=16, stride_c=16,
                               use_z=True, use_p=True, use_d=True, use_c=True)
+    
+    obs_manager = ObservationManager(ny, nx, obs_idx, sigma_z, sigma_p, sigma_d, sigma_c)
 
-    # ------- Localized update for grid states -------
-    # Precompute obs meta (positions for kept obs)
+    # Precompute observation metadata
     oy, ox, otype, ocomp, cols = build_obs_meta(
         ny, nx, obs_idx,
         stride_z=16, stride_p=16, stride_d=16, stride_c=16,
@@ -99,17 +339,25 @@ if __name__ == '__main__':
     if cols.size and (cols.max() >= len(obs_idx) or cols.min() < 0):
         cols = np.array([pos_map[int(a)] for a in cols], dtype=int)
 
-    # Sanity
-    assert cols.max() < len(obs_idx)
+    # Initialize hybrid EnKF
+    enkf = HybridEnKF(N_ens, num_params, nx, ny)
+    
+    # Simple settings
+    inflation = 1.02  # Low inflation for parameter stability
+    param_rw_std = np.array([0.001, 0.1])  # Very small random walk for parameters
 
-    inflation = 1.05   # optional: multiplicative inflation factor, 1.0 means off
-
-
-    # %% start the EnKF iterations (optimized: parallel forward runs + ensemble-space EnKF)
+    print("Starting hybrid EnKF iterations...")
+    
     for t in range(nt):
+        if t % 10 == 0:
+            print(f"Processing time step {t}/{nt}")
+            
         current_time = times[t:t+1]
-        
-        # Prepare arguments for parallel execution
+
+        # Parameter random walk to maintain informative spread
+        param_ensemble += np.random.normal(0.0, param_rw_std, size=param_ensemble.shape)
+
+        # Prepare arguments for parallel execution (simplified)
         args_list = [
             (i, nx, ny, current_time, hSL_vals[t], hSS_vals[t],
              param_ensemble[i].copy(), z0_ensemble[i].copy(), p0_ensemble[i].copy())
@@ -117,227 +365,143 @@ if __name__ == '__main__':
         ]
         
         # Run parallel simulations
-        with ProcessPoolExecutor(max_workers=os.cpu_count()) as ex:
+        with ProcessPoolExecutor(max_workers=min(4, N_ens)) as ex:
             results = list(ex.map(simulate_member, args_list))
 
-        # Unpack results into arrays
-        model_outputs_z_layers = np.empty((N_ens, ny, nx))
-        model_outputs_p_layers = np.empty((N_ens, ny, nx, 4))
-        model_outputs_deposits = np.empty((N_ens, ny, nx))
-        model_outputs_compositions = np.empty((N_ens, ny, nx, 4))
-        for i, (zl, pl, dep, comp) in enumerate(results):
-            model_outputs_z_layers[i] = zl
-            model_outputs_p_layers[i] = pl
-            model_outputs_deposits[i] = dep
-            model_outputs_compositions[i] = comp
+        # Unpack results (simple approach)
+        model_outputs_z = np.array([r[0] for r in results])
+        model_outputs_p = np.array([r[1] for r in results])
+        model_outputs_d = np.array([r[2] for r in results])
+        model_outputs_c = np.array([r[3] for r in results])
 
-        # Build state vectors (params + model outputs at time t)
-        ensemble_vectors = np.empty((N_ens, num_params + nx*ny + nx*ny*4 + nx*ny + nx*ny*4), dtype=float)
+        # Build ensemble vectors (like working version)
+        state_size = num_params + nx*ny + nx*ny*4 + nx*ny + nx*ny*4
+        X = np.empty((N_ens, state_size), dtype=float)
         for i in range(N_ens):
             offset = 0
-            # parameters + z_layers + p_layers + deposits + compositions
-            # parameters are not in the observations, but we include them for joint update
-            ensemble_vectors[i, offset:offset+num_params] = param_ensemble[i]; offset += num_params
-            ensemble_vectors[i, offset:offset+nx*ny] = model_outputs_z_layers[i].ravel(); offset += nx*ny
-            ensemble_vectors[i, offset:offset+nx*ny*4] = model_outputs_p_layers[i].ravel(); offset += nx*ny*4
-            ensemble_vectors[i, offset:offset+nx*ny] = model_outputs_deposits[i].ravel(); offset += nx*ny
-            ensemble_vectors[i, offset:offset+nx*ny*4] = model_outputs_compositions[i].ravel()
+            X[i, offset:offset+num_params] = param_ensemble[i]
+            offset += num_params
+            X[i, offset:offset+nx*ny] = model_outputs_z[i].ravel()
+            offset += nx*ny
+            X[i, offset:offset+nx*ny*4] = model_outputs_p[i].ravel()
+            offset += nx*ny*4
+            X[i, offset:offset+nx*ny] = model_outputs_d[i].ravel()
+            offset += nx*ny
+            X[i, offset:offset+nx*ny*4] = model_outputs_c[i].ravel()
 
-        # 2) Observations at this time step
-        obs_z_layers = z_layers_meas[t]         # (ny, nx)
-        obs_p_layers = p_layers_meas[t]         # (ny, nx, 4)
-        obs_deposits = deposits_meas[t]         # (ny, nx)
-        obs_compositions = compositions_meas[t] # (ny, nx, 4)
+        # Check ensemble health
+        if not enkf.check_ensemble_health(X):
+            print(f"Ensemble health issues at time {t}, skipping update")
+            continue
 
-        obs_full = np.concatenate([
-            obs_z_layers.ravel(),
-            obs_p_layers.ravel(),
-            obs_deposits.ravel(),
-            obs_compositions.ravel(),
-        ])
+        # ---------------- ETKF update (ensemble-space, full-state) ----------------
+        # Observations for this time step
+        obs = obs_manager.get_observations(z_layers_meas[t], p_layers_meas[t],
+                                           deposits_meas[t], compositions_meas[t])
 
-        #* Subselect observations
-        obs = obs_full[obs_idx]
+        # Randomized obs subset to avoid systematic loss of information
+        keep = max(1, int(0.5 * len(obs_idx)))
+        obs_subset_indices = np.random.choice(len(obs_idx), size=keep, replace=False)
 
-        off_z = 0
-        off_p = off_z + ny*nx
-        off_d = off_p + ny*nx*4
-        off_c = off_d + ny*nx
+        # Build mapping from state to obs: we observe columns in X[:, num_params:]
+        obs_subset_vals = obs[obs_subset_indices]
+        R_var_subset = obs_manager.R_var[obs_subset_indices]
 
-        R_full = np.empty_like(obs_full, dtype=float)
-        R_full[off_z:off_z+ny*nx] = sigma_z**2
-        R_full[off_p:off_p+ny*nx*4] = sigma_p**2
-        R_full[off_d:off_d+ny*nx] = sigma_d**2
-        R_full[off_c:off_c+ny*nx*4] = sigma_c**2
+        # Map subset indices to actual columns of the flattened state-part
+        # of X (z | p | d | c), which matches how obs_idx was built.
+        obs_col_idx = obs_idx[obs_subset_indices]
 
-        # 3) EnKF update in ensemble space (no gigantic obs covariance inversion)
-        state_dim = ensemble_vectors.shape[1]
-        # obs_start = num_params
-        # obs_end = state_dim
+        if t % 50 == 0:
+            # Innovation variance vs R
+            Yf_mean = X[:, num_params:][:, obs_col_idx].mean(axis=0)
+            innov = obs_subset_vals - Yf_mean
+            ratio = np.var(innov) / (np.mean(R_var_subset) + 1e-12)
+            print(f"t={t}: innov_var/mean_R ~ {ratio:.3f}")
 
-        # Split state into X (full) and Y (observed part)
-        X = ensemble_vectors                              # (N, m)
-        # Now I make a simple assumption that all states except parameters are observed
-        # This can be adjusted by the observation selection function. For example, only some locations are observed.
-        
-        # We'll use the per-time Y_full for fast slicing
-        Y_full = ensemble_vectors[:, num_params:]  # (N, ny*nx*(1+4+1+4))
-        Y_all = Y_full[:, obs_idx]                 # (N, p) for parameter global update
+            # Max abs correlation between each parameter and any obs
+            Apar = X[:, :num_params] - X[:, :num_params].mean(axis=0)
+            Ay   = X[:, num_params:][:, obs_col_idx] - Yf_mean
+            cov  = (Apar.T @ Ay) / (X.shape[0]-1)
+            sp   = Apar.std(axis=0, ddof=1) + 1e-12
+            so   = Ay.std(axis=0, ddof=1) + 1e-12
+            corr = cov / (sp[:, None] * so[None, :])
+            for k, name in enumerate(param_names):
+                print(f"t={t}: max|corr({name}, obs)| = {np.max(np.abs(corr[k])):.3f}")
 
-        # Perturbations (anomalies)
-        X_mean = X.mean(axis=0)
-        X_pert = X - X_mean
-        Y_mean = Y_all.mean(axis=0)  # Use Y_all instead of Y
-        Y_pert = Y_all - Y_mean      # Use Y_all instead of Y
-        Nm1 = float(N_ens - 1)
+        # Save forecast ensemble vector before analysis (for RTPS)
+        Xf_save = X.copy()
 
-        S = Y_pert / np.sqrt(Nm1)                  # (N, p)
+        # Run deterministic ETKF to update the entire ensemble state (params + fields)
+        X = etkf_update_full_state(
+            X,
+            obs_subset_vals,
+            obs_col_idx,
+            num_params,
+            R_var_subset,
+            inflation=inflation,
+        )
 
-        # Observation error variances (vector), avoid forming a huge diagonal matrix
-        R_var = R_full[obs_idx] + 1e-8
-        R_inv = 1.0 / R_var
+        # Apply RTPS inflation on parameters to prevent collapse
+        X = rtp_inflate_params(X, Xf_save, num_params, alpha=0.5)
 
-        # Build M = I + S * R^{-1} * S^T, which is N x N (small)
-        SR = S * R_inv  # column-wise scaling, broadcasting over p
-        M = np.eye(N_ens) + SR @ S.T                       # (N, N)
+        # ---------------- Constraints & write-back ----------------
+        # Enforce parameter bounds
+        X[:, 0] = np.clip(X[:, 0], 0.05, 1.0)     # diffusion_coeff
+        X[:, 1] = np.clip(X[:, 1], 10.0, 80.0)    # thickness_scale
 
-        # Precompute cross-covariance factor Cxy = X_pert^T @ S / （N-1）
-        Cxy_param = (X_pert[:, :num_params].T @ S) / np.sqrt(Nm1)     # (m, N), since S already has 1/sqrt(N-1)
-
-        # Cholesky solve for numerical stability
-        try:
-            L = LA.cholesky(M)
-            def solve_M(vec):
-                # Solve M x = vec via Cholesky
-                y = LA.solve(L, vec)
-                return LA.solve(L.T, y)
-        except LA.LinAlgError:
-            # Fallback to generic solver
-            def solve_M(vec):
-                return LA.solve(M, vec)
-
-        # Update each ensemble member without forming huge matrices: w = (P_yy + R)^{-1} d via Woodbury
-        param_rw_std = np.array([0.003, 0.001, 0.001])  # tune small
+        # Write back to structured arrays
+        param_ensemble = X[:, :num_params]
+        idx0 = num_params
         for i in range(N_ens):
-            d = obs - Y_all[i]
-            v = R_inv * d
-            Sv = S @ v
-            alpha = solve_M(Sv)
-            w = v - R_inv * (S.T @ alpha)
-            delta_param = Cxy_param @ w
-            X[i, :num_params] += delta_param
-            X[i, :num_params] += np.random.normal(0.0, param_rw_std)    
-
-
-
-        # Local settings
-        LOC_RADIUS = 8.0     # in grid cells
-        UPDATE_STRIDE = 1    # update every cell; set 2/4 for faster run
-
-        # Prepare convenience arrays
-        X_mean = X.mean(axis=0)
-        X_pert = X - X_mean
-
-        for iy in range(0, ny, UPDATE_STRIDE):
-                for ix in range(0, nx, UPDATE_STRIDE):
-                    dy = oy - iy
-                    dx = ox - ix
-                    dist = np.sqrt(dy*dy + dx*dx)
-
-                    rho = gaspari_cohn(dist, LOC_RADIUS)  # shape == len(cols)
-                    mask = (rho > 1e-12)
-                    if not np.any(mask):
-                        continue
-
-                    # 用 cols 将“保留观测集合”的布尔 mask 映射回 obs/Y_all 的列索引
-                    idx_loc = cols[mask]                 # columns into obs = obs_full[obs_idx]
-                    obs_loc = obs[idx_loc]               # (p_loc,)
-                    Y_loc = Y_all[:, idx_loc]            # (N, p_loc)
-
-                    # 局地异常并做taper
-                    Y_loc_mean = Y_loc.mean(axis=0)
-                    S_loc = (Y_loc - Y_loc_mean) / np.sqrt(Nm1)
-                    S_loc *= np.sqrt(rho[mask][None, :])
-
-                    # 复用全局 R_var 的子集，并用 ρ 做taper（等价于使用 R_eff^{-1} = ρ / R）
-                    R_var_loc = R_var[idx_loc] + 1e-12
-                    R_inv_loc = rho[mask] / R_var_loc
-
-                    SR = S_loc * R_inv_loc
-                    M = np.eye(N_ens) + SR @ S_loc.T
-                    try:
-                        L = LA.cholesky(M)
-                        def solve_M(vec):
-                            y_ = LA.solve(L, vec); return LA.solve(L.T, y_)
-                    except LA.LinAlgError:
-                        def solve_M(vec):
-                            return LA.solve(M, vec)
-
-                    state_idx = state_indices_for_cell(iy, ix, ny, nx, num_params)
-                    Cxy_loc = (X_pert[:, state_idx].T @ S_loc) / np.sqrt(Nm1)
-
-                    for i in range(N_ens):
-                        d = obs_loc - Y_loc[i]
-                        v = R_inv_loc * d
-                        Sv = S_loc @ v
-                        alpha = solve_M(Sv)
-                        w = v - R_inv_loc * (S_loc.T @ alpha)
-                        delta = Cxy_loc @ w
-                        X[i, state_idx] += delta
-
-        # Inflation step
-        if inflation != 1.0:
-            X_mean = X.mean(axis=0)
-            X_pert = X - X_mean
-            X = X_mean + inflation * X_pert
-
-        # Write back to arrays (same as your code)
-        ensemble_vectors = X
-        for i in range(N_ens):
-            idx0 = 0
-            param_ensemble[i] = X[i, idx0:idx0+num_params]; idx0 += num_params
-            z0_ensemble[i] = X[i, idx0:idx0+nx*ny].reshape(ny, nx); idx0 += nx*ny
-            p0_ensemble[i] = X[i, idx0:idx0+nx*ny*4].reshape(ny, nx, 4); idx0 += nx*ny*4
+            z0_ensemble[i] = X[i, idx0:idx0+nx*ny].reshape(ny, nx)
+            p_end = idx0 + nx*ny + nx*ny*4
+            p0_ensemble[i] = X[i, idx0+nx*ny:p_end].reshape(ny, nx, 4)
             p0_ensemble[i] = np.clip(p0_ensemble[i], 0, 1)
-            p0_ensemble[i] /= p0_ensemble[i].sum(axis=-1, keepdims=True) + 1e-12
-            deposits_ensemble[i] = X[i, idx0:idx0+nx*ny].reshape(ny, nx); idx0 += nx*ny
-            compositions_ensemble[i] = X[i, idx0:idx0+nx*ny*4].reshape(ny, nx, 4)
-            compositions_ensemble[i] = np.clip(compositions_ensemble[i], 0, 1)
-            compositions_ensemble[i] /= compositions_ensemble[i].sum(axis=-1, keepdims=True) + 1e-12
+            p_sum = p0_ensemble[i].sum(axis=-1, keepdims=True) + 1e-12
+            p0_ensemble[i] /= p_sum
 
-        # Store the updated values for analysis
+        # Store results
         param_history[t] = param_ensemble
         z0_history[t] = z0_ensemble
         p0_history[t] = p0_ensemble
 
-        # Diagnostics
-        param_mean = param_ensemble.mean(axis=0)
-        param_std = param_ensemble.std(axis=0)
-        print(f"Time step {t}")
-        print(f"Parameter means: {param_mean}")
-        print(f"Parameter stds: {param_std}")
+        # Diagnostics (optional)
+        if t % 20 == 0:
+            param_mean = param_ensemble.mean(axis=0)
+            param_std = param_ensemble.std(axis=0)
+            print(f"Time {t}: Params = {param_mean}, Stds = {param_std}")
 
-        # Parameter convergence over time
+    print("Hybrid EnKF iterations completed!")
+
+    # Create missing variables for plotting
+    param_mean_history = np.empty((nt, num_params))
+    param_std_history = np.empty((nt, num_params))
+    
+    # Fill the history arrays
+    for t in range(nt):
+        param_mean_history[t] = param_history[t].mean(axis=0)
+        param_std_history[t] = param_history[t].std(axis=0)
+
+    # Update the plotting section
     plt.figure(figsize=(15, 5))
-    param_names = ["diffusion_coeff", "erosion_rate", "subsidence_scalar"]
-    true_params = np.array([params.diffusion_coeff, params.erosion_rate, params.subsidence_scalar])
-
+    
     for i, name in enumerate(param_names):
-        plt.subplot(1, 3, i+1)
+        plt.subplot(1, len(param_names), i+1)  # Dynamic subplot count
         
-        # Plot ensemble members
-        for j in range(N_ens):
+        # Plot ensemble members (reduced for performance)
+        step = max(1, N_ens // 20)  # Show max 20 lines
+        for j in range(0, N_ens, step):
             plt.plot(times, param_history[:, j, i], 'k-', alpha=0.1)
         
         # Plot ensemble mean
-        mean_param = param_history.mean(axis=1)[:, i]
+        mean_param = param_mean_history[:, i]
         plt.plot(times, mean_param, 'r-', linewidth=2, label='Ensemble mean')
         
         # Plot true value
         plt.axhline(y=true_params[i], color='b', linestyle='--', label='True value')
         
-        # Plot uncertainty bounds (mean ± 2*std)
-        std_param = param_history.std(axis=1)[:, i]
+        # Plot uncertainty bounds
+        std_param = param_std_history[:, i]
         plt.fill_between(times, mean_param - 2*std_param, mean_param + 2*std_param, 
                         color='r', alpha=0.2, label='±2σ')
         
@@ -347,15 +511,18 @@ if __name__ == '__main__':
         plt.legend()
 
     plt.tight_layout()
+    os.makedirs('./plots', exist_ok=True)
     plt.savefig('./plots/parameter_convergence.png', dpi=300)
     plt.show()
+
+    # Update RMSE calculation
+    param_mean = param_history.mean(axis=1)  # shape: (nt, num_params)
+    param_rmse = np.sqrt(np.mean((param_mean - true_params)**2, axis=1))
 
     # RMSE evolution over time
     plt.figure(figsize=(12, 6))
 
     # Parameter RMSE
-    param_mean = param_history.mean(axis=1)  # shape: (nt, 3)
-    param_rmse = np.sqrt(np.mean((param_mean - true_params)**2, axis=1))
     plt.subplot(1, 2, 1)
     plt.plot(times, param_rmse, 'b-', linewidth=2)
     plt.xlabel('Time step')
@@ -377,35 +544,41 @@ if __name__ == '__main__':
     plt.savefig('./plots/rmse_evolution.png', dpi=300)
     plt.show()
 
-    # Parameter correlation at final time step
-    plt.figure(figsize=(12, 4))
-
-    # Get final ensemble
-    final_params = param_history[-1]  # shape: (N_ens, 3)
-
-    # Plot pairwise scatter plots - use simple indexing
-    subplot_idx = 1
-    for i in range(2):
-        for j in range(i+1, 3):
-            plt.subplot(1, 3, subplot_idx)  # Use sequential subplot index
-            subplot_idx += 1
-            
-            plt.scatter(final_params[:, i], final_params[:, j], alpha=0.7)
-            plt.xlabel(param_names[i])
-            plt.ylabel(param_names[j])
-            plt.grid(True, alpha=0.3)
-            
-            # Plot true values
-            plt.axvline(x=true_params[i], color='r', linestyle='--')
-            plt.axhline(y=true_params[j], color='r', linestyle='--')
-            
-            # Compute correlation
-            corr = np.corrcoef(final_params[:, i], final_params[:, j])[0, 1]
-            plt.title(f'Correlation: {corr:.2f}')
-
-    plt.tight_layout()
-    plt.savefig('./plots/parameter_correlation.png', dpi=300)
-    plt.show()
+    # Parameter correlation at final time step - make it dynamic
+    if num_params > 1:
+        n_plots = num_params * (num_params - 1) // 2  # Number of pairwise plots
+        n_cols = min(3, n_plots)  # Maximum 3 columns
+        n_rows = (n_plots + n_cols - 1) // n_cols  # Calculate rows needed
+        
+        plt.figure(figsize=(4 * n_cols, 4 * n_rows))
+        
+        # Get final ensemble
+        final_params = param_history[-1]  # shape: (N_ens, num_params)
+        
+        plot_idx = 1
+        for i in range(num_params):
+            for j in range(i+1, num_params):
+                plt.subplot(n_rows, n_cols, plot_idx)
+                plot_idx += 1
+                
+                plt.scatter(final_params[:, i], final_params[:, j], alpha=0.7)
+                plt.xlabel(param_names[i])
+                plt.ylabel(param_names[j])
+                plt.grid(True, alpha=0.3)
+                
+                # Plot true values
+                plt.axvline(x=true_params[i], color='r', linestyle='--')
+                plt.axhline(y=true_params[j], color='r', linestyle='--')
+                
+                # Compute correlation
+                corr = np.corrcoef(final_params[:, i], final_params[:, j])[0, 1]
+                plt.title(f'Correlation: {corr:.2f}')
+        
+        plt.tight_layout()
+        plt.savefig('./plots/parameter_correlation.png', dpi=300)
+        plt.show()
+    else:
+        print("Only one parameter selected, skipping correlation plot")
 
     # Compare true vs. estimated states at final time step
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))

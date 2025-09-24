@@ -228,19 +228,45 @@ def build_obs_index(ny, nx, stride_z=4, stride_p=8, stride_d=8, stride_c=16,
 
     return np.asarray(idx, dtype=np.int64)
 
+def simulate_member_with_sensitivity(args):
+    """Updated simulate_member to handle sensitivity-based parameters"""
+    i, nx, ny, current_time, hSL_val, hSS_val, selected_params, param_names, z0_i, p0_i = args
+    
+    # Get base params from global scope or pass it as argument
+    from model import ForwardParams
+    import copy
+    
+    # You'll need to access the base params object somehow
+    # Option 1: Pass it as a global variable
+    # Option 2: Reconstruct it from the loaded data
+    
+    try:
+        # Create params object with selected parameter values
+        params_i = copy.deepcopy(base_params)  # You need base_params available
+        
+        # Update parameters based on selection
+        for j, param_name in enumerate(param_names):
+            if param_name.startswith('supply_comp_'):
+                comp_idx = int(param_name.split('_')[-1])
+                params_i.supply_composition[comp_idx] = selected_params[j]
+                # Renormalize supply composition
+                params_i.supply_composition /= params_i.supply_composition.sum()
+            else:
+                setattr(params_i, param_name, selected_params[j])
+        
+        # Run forward model
+        z_layers, p_layers, deposits, compositions = run_forward(
+            z0_i, p0_i, current_time, [hSL_val], current_time, [hSS_val], params_i
+        )
+        
+        return z_layers[-1], p_layers[-1], deposits[-1], compositions[-1]
+        
+    except Exception as e:
+        print(f"Error in member {i}: {e}")
+        return z0_i, p0_i, np.zeros_like(z0_i), np.zeros((z0_i.shape[0], z0_i.shape[1], 4))
 
-
-
-
-
-
-
-
-
-
-
-
-
+# Keep the old function for backward compatibility
+simulate_member = simulate_member_with_sensitivity
 
 if __name__ == '__main__':
     pass

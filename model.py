@@ -1,6 +1,7 @@
 # %%
 import numpy as np
 from dataclasses import dataclass, field
+from typing import Union, Optional
 import matplotlib.pyplot as plt
 import os
 
@@ -61,7 +62,7 @@ class ForwardParams:
     erosion_rate: float = 0.0
     
     # Subsidence parameters
-    subsidence_rate: np.ndarray | None = None  # (ny, nx)
+    subsidence_rate: Optional[np.ndarray] = None  # (ny, nx)
     subsidence_scalar: float = 0.0
     
     # Basin geometry (normalized coordinates)
@@ -75,7 +76,7 @@ class ForwardParams:
     supply_composition: np.ndarray = field(
         default_factory=lambda: np.array([0.50, 0.30, 0.15, 0.05])
     )
-    source_mask: np.ndarray | None = None  # (ny, nx)
+    source_mask: Optional[np.ndarray] = None  # (ny, nx)
     thickness_scale: float = 1.0
 
 def run_forward(z0, p0, hSL_times, hSL_vals, hSS_times, hSS_vals, params):
