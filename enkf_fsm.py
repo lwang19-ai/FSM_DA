@@ -208,6 +208,18 @@ def rtp_inflate_params(Xa, Xf, num_params, alpha=0.5):
     aA[:, :num_params] *= factor
     return am + aA
 
+# -------------------- Small Laplacian smoother (state only) --------------------
+
+def lap_smooth_2d(field, w=0.03):
+    """One Jacobi step of Laplacian smoothing for a 2D array."""
+    f = field.copy()
+    if field.shape[0] > 2 and field.shape[1] > 2:
+        f[1:-1,1:-1] += w * (
+            field[2:,1:-1] + field[:-2,1:-1] + field[1:-1,2:] + field[1:-1,:-2]
+            - 4.0*field[1:-1,1:-1]
+        )
+    return f
+
 def simulate_member(args):
     """Simple simulation function (based on working version)"""
     i, nx, ny, current_time, hSL_val, hSS_val, param_values, z0_i, p0_i = args
@@ -354,8 +366,10 @@ if __name__ == '__main__':
             
         current_time = times[t:t+1]
 
-        # Parameter random walk to maintain informative spread
-        param_ensemble += np.random.normal(0.0, param_rw_std, size=param_ensemble.shape)
+        # Parameter random walk with time-decay (keeps spread early, calms late)
+        decay = max(0.2, 1.0 - t/nt)
+        rw = param_rw_std * decay
+        param_ensemble += np.random.normal(0.0, rw, size=param_ensemble.shape)
 
         # Prepare arguments for parallel execution (simplified)
         args_list = [
@@ -402,6 +416,9 @@ if __name__ == '__main__':
         # Randomized obs subset to avoid systematic loss of information
         keep = max(1, int(0.5 * len(obs_idx)))
         obs_subset_indices = np.random.choice(len(obs_idx), size=keep, replace=False)
+        # Every 20 steps, assimilate all observations to re-anchor the solution
+        if t % 20 == 0:
+            obs_subset_indices = np.arange(len(obs_idx))
 
         # Build mapping from state to obs: we observe columns in X[:, num_params:]
         obs_subset_vals = obs[obs_subset_indices]
@@ -411,16 +428,18 @@ if __name__ == '__main__':
         # of X (z | p | d | c), which matches how obs_idx was built.
         obs_col_idx = obs_idx[obs_subset_indices]
 
+        # Innovation stats for adaptive RTPS
+        Yf_mean_step = X[:, num_params:][:, obs_col_idx].mean(axis=0)
+        innov_step = obs_subset_vals - Yf_mean_step
+        ratio_step = np.var(innov_step) / (np.mean(R_var_subset) + 1e-12)
+
         if t % 50 == 0:
             # Innovation variance vs R
-            Yf_mean = X[:, num_params:][:, obs_col_idx].mean(axis=0)
-            innov = obs_subset_vals - Yf_mean
-            ratio = np.var(innov) / (np.mean(R_var_subset) + 1e-12)
-            print(f"t={t}: innov_var/mean_R ~ {ratio:.3f}")
+            print(f"t={t}: innov_var/mean_R ~ {ratio_step:.3f}")
 
             # Max abs correlation between each parameter and any obs
             Apar = X[:, :num_params] - X[:, :num_params].mean(axis=0)
-            Ay   = X[:, num_params:][:, obs_col_idx] - Yf_mean
+            Ay   = X[:, num_params:][:, obs_col_idx] - Yf_mean_step
             cov  = (Apar.T @ Ay) / (X.shape[0]-1)
             sp   = Apar.std(axis=0, ddof=1) + 1e-12
             so   = Ay.std(axis=0, ddof=1) + 1e-12
@@ -441,8 +460,17 @@ if __name__ == '__main__':
             inflation=inflation,
         )
 
-        # Apply RTPS inflation on parameters to prevent collapse
-        X = rtp_inflate_params(X, Xf_save, num_params, alpha=0.5)
+        # Adaptive RTPS: stronger when underfitting (ratio≈1), weaker when overfitting
+        alpha = float(np.clip(0.6 * min(1.0, ratio_step), 0.15, 0.6))
+        X = rtp_inflate_params(X, Xf_save, num_params, alpha=alpha)
+
+        # Light smoothing of the elevation field analysis to suppress grid-scale noise
+        z_off = num_params
+        z_end = z_off + nx*ny
+        for i in range(N_ens):
+            z2d = X[i, z_off:z_end].reshape(ny, nx)
+            z2d = lap_smooth_2d(z2d, w=0.03)
+            X[i, z_off:z_end] = z2d.ravel()
 
         # ---------------- Constraints & write-back ----------------
         # Enforce parameter bounds
@@ -472,6 +500,11 @@ if __name__ == '__main__':
             print(f"Time {t}: Params = {param_mean}, Stds = {param_std}")
 
     print("Hybrid EnKF iterations completed!")
+
+    # Ensure directories exist
+    os.makedirs('./plots', exist_ok=True)
+    os.makedirs('./results', exist_ok=True)
+    print("Generating and saving plots and results...")
 
     # Create missing variables for plotting
     param_mean_history = np.empty((nt, num_params))
@@ -626,3 +659,33 @@ if __name__ == '__main__':
     plt.grid(True, alpha=0.3)
     plt.savefig('./plots/uncertainty_reduction.png', dpi=300)
     plt.show()
+
+    # Save numerical results
+    print("Saving numerical results...")
+    np.savez('./results/enkf_results.npz',
+             param_history=param_history,
+             param_mean_history=param_mean_history,
+             param_std_history=param_std_history,
+             z0_history=z0_history,
+             p0_history=p0_history,
+             times=times,
+             param_names=param_names,
+             true_params=true_params,
+             param_rmse=param_rmse,
+             z_rmse=z_rmse,
+             N_ens=N_ens,
+             num_params=num_params)
+
+    # Summary of saved files
+    print("\n" + "="*60)
+    print("ANALYSIS COMPLETE - All files saved successfully!")
+    print("="*60)
+    print("Generated plots in ./plots/ directory:")
+    print("1. parameter_convergence.png    - Parameter evolution over time")
+    print("2. rmse_evolution.png           - Parameter & state errors")
+    print("3. parameter_correlation.png    - Parameter correlations")
+    print("4. state_comparison.png         - True vs estimated final states")
+    print("5. uncertainty_reduction.png    - Parameter uncertainty reduction")
+    print("\nNumerical results saved in ./results/ directory:")
+    print("• enkf_results.npz              - All EnKF results and histories")
+    print("="*60)
